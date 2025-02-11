@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 from google.api_core.exceptions import InternalServerError
 
 from core.plugin import Plugin
+from core.tools import rate_limit
 
 ROOT_DIR = Path(__file__).parent.parent
 PLUGINS_DIR = ROOT_DIR / "plugins"
@@ -24,12 +25,13 @@ class Agent:
 
         self.system_prompt = system_prompt
         self.plugins = {}
-        self.tools = []
+        self.tools = [self.core_sleep]
         self.load_plugins()
-        self.available_tools = self.build_tools()
+        self.build_tools()
         self.model = genai.GenerativeModel(
             model_name="gemini-2.0-flash", tools=self.tools
         )
+        self.chat = self.model.start_chat()
 
     def load_plugins(self):
         """Load plugins"""
@@ -69,21 +71,22 @@ class Agent:
             )
         print(f"Loaded tools: {[t.__name__ for t in self.tools]}")
 
+    @rate_limit(interval=5)
+    def send_message(self, message):
+        """Send a message to the chat"""
+        return self.chat.send_message(message)
+
     def run(self):
         """Start the agent"""
         try:
-            chat = self.model.start_chat()
             response_parts = None
             print("Running...")
 
             # Agent loop
             while True:
-                # Sleep to avoid rate limits
-                time.sleep(5)
-
                 # Receive a call request
                 try:
-                    call_request = chat.send_message(
+                    call_request = self.send_message(
                         response_parts or self.system_prompt
                     )
                 except InternalServerError:
@@ -91,26 +94,33 @@ class Agent:
                     continue
 
                 # Get the function call request
+                fn = None
                 method = None
                 for part in call_request.parts:
                     fn = part.function_call
                     if not fn:
                         continue
-                    plugin = self.plugins[fn.name.split("_")[0].lower()]
-                    method = getattr(plugin, fn.name)
+                    class_id = fn.name.split("_")[0].lower()
+                    if class_id == "core":
+                        method = getattr(self, fn.name)
+                    else:
+                        plugin = self.plugins[class_id]
+                        method = getattr(plugin, fn.name)
                     kwargs = dict(fn.args)
+                    break
 
                 if not method:
                     continue
 
                 # Make the call
                 try:
+                    print(f"Calling {method.__name__}({kwargs})")
                     result = method(**kwargs)
                 except Exception as e:
                     print(f"Exception while calling the function: {e}")
                     continue
 
-                print(f"Called {fn.name}({kwargs}): {result}")
+                print(f"Result: {result}\n")
 
                 # Build the response
                 function_calls = {fn.name: result}
@@ -126,3 +136,7 @@ class Agent:
 
         except KeyboardInterrupt:
             print("Agent stopped")
+
+    def core_sleep(self, seconds: int) -> None:
+        """Sleep for a number of seconds"""
+        time.sleep(seconds)
