@@ -1,3 +1,4 @@
+import json
 from typing import List, Optional
 
 import requests
@@ -33,6 +34,13 @@ class Coingecko(Plugin):
         try:
             response = requests.get(url, params=params, headers=headers, timeout=60)
             response.raise_for_status()
-            return response.json()
+            memecoins = response.json()
+
+            with open(
+                self.storage_path / "memecoins.json", "w", encoding="utf-8"
+            ) as memecoins_file:
+                json.dump(memecoins, memecoins_file, indent=4)
+
+            return memecoins
         except requests.exceptions.RequestException:
             return None

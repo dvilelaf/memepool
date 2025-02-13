@@ -80,6 +80,7 @@ class Agent:
                 return result
             except ResourceExhausted:
                 print("Hit rate limit. Retrying...")
+                time.sleep(30)
                 pass
 
     def run(self):

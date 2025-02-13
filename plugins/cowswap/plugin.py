@@ -1,21 +1,18 @@
 import json
 import time
-from decimal import Decimal
 from pathlib import Path
 
 import requests
 from ape import accounts
 from eip712 import EIP712Message
-from eth_abi import encode
-from eth_account.messages import _hash_eip191_message, encode_typed_data
+from eth_account.messages import _hash_eip191_message
 from eth_utils import decode_hex, encode_hex
 from safe_eth.eth import EthereumClient
 from safe_eth.safe import Safe as GnosisSafe
-from safe_eth.safe.safe_tx import SafeTx
 from web3 import Web3
 
 from core.plugin import Plugin
-from plugins.cowswap.constants import ERC20_ABI, SAFE_ABI
+from plugins.cowswap.constants import SAFE_ABI
 
 BASE_COW_API = "https://api.cow.fi/base"
 SAFE_TRANSACTION_SERVICE_URL = "https://safe-transaction-base.safe.global"
@@ -55,10 +52,10 @@ class Order(EIP712Message):
     buyTokenBalance: "string"
 
 
-class Safe(Plugin):
-    """A plugin to interact with a Safe multisig wallet and Cowswap"""
+class CowSwap(Plugin):
+    """A plugin to interact with Cowswap via a Safe multisig wallet"""
 
-    NAME = "Safe"
+    NAME = "CowSwap"
     ENV_VARS = ["BASE_RPC", "SIGNER_PRIVATE_KEY", "SAFE_ADDRESS", "APE_ACCOUNTS_NAME"]
 
     def __init__(self):
@@ -66,8 +63,7 @@ class Safe(Plugin):
         super().__init__()
 
         self.ledger = Web3(Web3.HTTPProvider(self.base_rpc))
-        self.wallet = Web3().eth.account.from_key(self.private_key)
-        self.safe = GnosisSafe(self.address, EthereumClient(self.base_rpc))
+        self.safe = GnosisSafe(self.safe_address, EthereumClient(self.base_rpc))
 
         self.signer = accounts.load(self.ape_accounts_name)
         self.signer.set_autosign(True)
@@ -92,10 +88,11 @@ class Safe(Plugin):
 
     def cowswap_sell_tokens_tool(
         self,
-        sell_token_address: str,
+        sell_token_name: str,
     ):
         """A tool to sell tokens on Cowswap"""
 
+        sell_token_address = self.get_memecoin_address(sell_token_name)
         buy_token_address = USDC_ADDRESS_BASE
         sell_amount_eth = self.get_erc20_balance(sell_token_address)
         sell_amount_wei = Web3.to_wei(sell_amount_eth, "ether")
@@ -108,12 +105,13 @@ class Safe(Plugin):
 
     def cowswap_buy_tokens_tool(
         self,
-        buy_token_address: str,
+        buy_token_name: str,
     ):
         """A tool to buy tokens on Cowswap"""
 
-        self.approve_allowance(buy_token_address)
+        buy_token_address = self.get_memecoin_address(buy_token_name)
         sell_token_address = USDC_ADDRESS_BASE
+        self.approve_allowance(sell_token_address)
         sell_amount_wei = 1000000  # 1$ (USDC has 6 decimals)
 
         self.swap(
@@ -166,7 +164,14 @@ class Safe(Plugin):
             buyTokenBalance=quote["buyTokenBalance"],
         )
 
-        print(f"Order: {order.sellAmount / 1e18} -> {order.buyAmount / 1e18}")
+        if sell_token_address == USDC_ADDRESS_BASE:
+            print(
+                f"Order: {order.sellAmount / 1e6} USDC -> {order.buyAmount / 1e18} {buy_token_address}"
+            )
+        else:
+            print(
+                f"Order: {order.sellAmount} {sell_token_address / 1e18} -> {order.buyAmount / 1e6} USDC"
+            )
 
         order_digest = _hash_eip191_message(order.signable_message)
         safe_message = SafeMessage(message=order_digest)
@@ -193,50 +198,107 @@ class Safe(Plugin):
             "signature": encode_hex(encoded_signature),
             "from": SAFE_ADDRESS,
         }
-        resp = requests.post(f"{BASE_COW_API}/api/v1/orders", json=payload, timeout=60)
+        response = requests.post(
+            f"{BASE_COW_API}/api/v1/orders", json=payload, timeout=60
+        )
 
-        return resp.status_code == 201
+        success = response.status_code == 201
+        print(response.text)
+        print(
+            f"Swap success: {success} https://explorer.cow.fi/base/orders/{response.json()}"
+        )
+        return success
 
     def approve_allowance(self, erc20_contract_address):
         """Approve allowance"""
 
-        safe_contract = self.ledger.eth.contract(
-            address=self.safe_address, abi=SAFE_ABI
-        )
+        print(f"Approving {BASE_GPV2_VAULT_RELAYER} to spend {erc20_contract_address}")
+
         erc20_contract = self.ledger.eth.contract(
-            address=erc20_contract_address, abi=ERC20_ABI
+            address=erc20_contract_address, abi=self.erc20_abi
         )
 
-        approve_data = erc20_contract.encode_abi(
-            "approve", args=[BASE_GPV2_VAULT_RELAYER, MAX_APPROVAL]
+        # Get the safe nonce
+        response = requests.get(
+            url=f"{SAFE_TRANSACTION_SERVICE_URL}/api/v1/safes/{SAFE_ADDRESS}",
+            timeout=60,
         )
+        safe_nonce = response.json()["nonce"]
 
-        # Crear transacción del Safe
-        safe_tx = safe_contract.functions.execTransaction(
-            erc20_contract_address,  # to
-            0,  # value
-            approve_data,  # data
-            0,  # operation (CALL)
-            0,
-            0,
-            0,  # safeTxGas, baseGas, gasPrice
-            "0x0000000000000000000000000000000000000000",  # gasToken
-            "0x0000000000000000000000000000000000000000",  # refundReceiver
+        # Build the internal transaction
+        estimated_gas = self.ledger.eth.estimate_gas(
+            {
+                "from": self.safe.address,
+                "to": erc20_contract.address,
+                "data": erc20_contract.encode_abi(
+                    "approve", args=[BASE_GPV2_VAULT_RELAYER, MAX_APPROVAL]
+                ),
+            }
+        )
+        gas_price = max(self.ledger.eth.gas_price, self.ledger.to_wei("1", "gwei"))
+
+        estimated_gas = 1000000
+        gas_price = self.ledger.to_wei("10", "gwei")
+
+        approve_tx = erc20_contract.functions.approve(
+            BASE_GPV2_VAULT_RELAYER,
+            MAX_APPROVAL,
         ).build_transaction(
             {
                 "chainId": BASE_CHAIN_ID,
-                "from": self.safe_address,
-                "nonce": self.ledger.eth.get_transaction_count(self.safe_address),
-                "gas": 1000000,
-                "gasPrice": self.ledger.to_wei("3", "gwei"),
+                "gas": estimated_gas,
+                "gasPrice": gas_price,
+                "nonce": safe_nonce,
             }
         )
 
-        signed_tx = self.ledger.eth.account.sign_transaction(
-            safe_tx, self.signer_private_key
+        # Build the safe transaction
+        safe_tx = self.safe.build_multisig_tx(  # nosec
+            to=erc20_contract.address,
+            value=0,
+            data=approve_tx["data"],
+            operation=0,
+            safe_tx_gas=1000000,
+            base_gas=0,
+            # gas_price=gas_price,
+            gas_token="0x0000000000000000000000000000000000000000",
+            refund_receiver="0x0000000000000000000000000000000000000000",
         )
-        tx_hash = self.ledger.eth.send_raw_transaction(signed_tx.raw_transaction)
+
+        # Sign
+        safe_tx.sign(self.signer_private_key)
+        print(safe_tx)
+        print(safe_tx.safe_tx_hash.hex())
+
+        # Send
+        tx_hash, _ = safe_tx.execute(self.signer_private_key)
+
+        # Wait
         tx_receipt = self.ledger.eth.wait_for_transaction_receipt(tx_hash)
         success = tx_receipt.status == 1
-        print(f"Swap success: {success}")
+        print(f"Allowance success: {success}")
         return success
+
+    def get_memecoin_address(self, memecoin_name):
+        """Get the address"""
+
+        coin_id = memecoin_name.lower()
+        detailed_url = f"https://api.coingecko.com/api/v3/coins/{coin_id}"
+
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3"
+        }
+
+        try:
+            # Fetch detailed coin information
+            detailed_response = requests.get(detailed_url, headers=headers, timeout=60)
+            detailed_response.raise_for_status()
+            detailed_data = detailed_response.json()
+
+            # Extract Base network contract address
+            contract_address = detailed_data.get("platforms", {}).get("base", None)
+            print(f"{memecoin_name} adress is {contract_address}")
+            return Web3.to_checksum_address(contract_address)
+        except Exception:
+            print(f"Couldnt get the address for {memecoin_name}")
+            return None

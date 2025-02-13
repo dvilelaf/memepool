@@ -28,12 +28,12 @@ class Ledger(Plugin):
         """Get the current block"""
         return self.ledger.eth.get_block("latest")
 
-    def ledger_get_native_balance_tool(self, wallet_address: str):
+    def ledger_get_native_balance(self, wallet_address: str):
         """Get the native balance of a wallet address"""
         balance_wei = self.ledger.eth.get_balance(wallet_address)
         return self.ledger.from_wei(balance_wei, "ether")
 
-    def ledger_get_erc20_balance_tool(
+    def ledger_get_erc20_balance(
         self, erc20_contract_address: str, wallet_address: str
     ):
         """Get the ERC20 balance of a wallet address"""
