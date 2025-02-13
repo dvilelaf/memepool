@@ -86,3 +86,11 @@ class Twitter(Plugin):
     def twitter_search_tweet_tool(self, query: str, count: int = 20) -> Optional[Dict]:
         """Search tweets based on a query"""
         return self.loop.run_until_complete(self.search_tweet(query, count))
+
+    # get mentions
+
+    # respond to mentions
+
+    # limit tweets
+
+    # create meme

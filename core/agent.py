@@ -6,7 +6,7 @@ from pathlib import Path
 
 import google.generativeai as genai
 from dotenv import load_dotenv
-from google.api_core.exceptions import InternalServerError
+from google.api_core.exceptions import InternalServerError, ResourceExhausted
 
 from core.plugin import Plugin
 from core.tools import rate_limit
@@ -71,10 +71,16 @@ class Agent:
             )
         print(f"Loaded tools: {[t.__name__ for t in self.tools]}")
 
-    @rate_limit(interval=5)
+    @rate_limit(interval=10)
     def send_message(self, message):
         """Send a message to the chat"""
-        return self.chat.send_message(message)
+        while True:
+            try:
+                result = self.chat.send_message(message)
+                return result
+            except ResourceExhausted:
+                print("Hit rate limit. Retrying...")
+                pass
 
     def run(self):
         """Start the agent"""
